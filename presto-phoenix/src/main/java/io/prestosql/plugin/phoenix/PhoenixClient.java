@@ -46,7 +46,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.client.HBaseAdmin;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
@@ -559,7 +560,7 @@ public class PhoenixClient
         ImmutableMap.Builder<String, Object> properties = ImmutableMap.builder();
 
         try (PhoenixConnection connection = (PhoenixConnection) connectionFactory.openConnection(session);
-                HBaseAdmin admin = connection.getQueryServices().getAdmin()) {
+                Admin admin = connection.getQueryServices().getAdmin()) {
             String schemaName = toPhoenixSchemaName(Optional.ofNullable(handle.getSchemaName())).orElse(null);
             PTable table = getTable(connection, SchemaUtil.getTableName(schemaName, handle.getTableName()));
 
@@ -587,7 +588,7 @@ public class PhoenixClient
                 properties.put(PhoenixTableProperties.DEFAULT_COLUMN_FAMILY, defaultFamilyName);
             }
 
-            HTableDescriptor tableDesc = admin.getTableDescriptor(table.getPhysicalName().getBytes());
+            HTableDescriptor tableDesc = admin.getTableDescriptor(TableName.valueOf(table.getPhysicalName().getBytes()));
 
             HColumnDescriptor[] columnFamilies = tableDesc.getColumnFamilies();
             for (HColumnDescriptor columnFamily : columnFamilies) {
@@ -684,7 +685,7 @@ public class PhoenixClient
             PName physicalTableName = queryPlan.getTableRef().getTable().getPhysicalName();
             PhoenixConnection phoenixConnection = context.getConnection();
             ConnectionQueryServices services = phoenixConnection.getQueryServices();
-            services.clearTableRegionCache(physicalTableName.getBytes());
+            services.clearTableRegionCache(TableName.valueOf(physicalTableName.getBytes()));
 
             for (Scan scan : scans) {
                 scan = new Scan(scan);

@@ -91,8 +91,14 @@
         <dependency>
             <groupId>org.apache.phoenix</groupId>
             <artifactId>phoenix-client</artifactId>
-            <version>4.14.1-HBase-1.4</version>
-            <classifier>embedded</classifier>
+            <version>5.0.0-cdh6.2.0</version>
+            <scope>compile</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
@@ -303,6 +309,16 @@
             <plugin>
                 <groupId>org.basepom.maven</groupId>
                 <artifactId>duplicate-finder-maven-plugin</artifactId>
+                <version>1.4.0</version>
+                <executions>
+                    <execution>
+                        <id>default</id>
+                        <phase>deploy</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
                 <configuration>
                     <ignoredResourcePatterns>
                         <ignoredResourcePattern>mrapp-generated-classpath</ignoredResourcePattern>
