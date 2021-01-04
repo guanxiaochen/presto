@@ -425,6 +425,11 @@ public class ServerMainModule
         // thread visualizer
         jaxrsBinder(binder).bind(ThreadResource.class);
 
+        // catalog resource
+        jaxrsBinder(binder).bind(CatalogResource.class);
+        jsonCodecBinder(binder).bindJsonCodec(CatalogInfo.class);
+        jsonCodecBinder(binder).bindJsonCodec(NodeInfo.class);
+
         // PageSorter
         binder.bind(PageSorter.class).to(PagesIndexPageSorter.class).in(Scopes.SINGLETON);
 
