@@ -13,13 +13,15 @@
  */
 package io.prestosql.server;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
+import com.google.common.io.ByteStreams;
 import com.google.common.net.HttpHeaders;
 import io.airlift.discovery.client.Announcer;
 import io.airlift.discovery.client.ServiceAnnouncement;
 import io.airlift.http.client.HttpClient;
-import io.airlift.http.client.HttpStatus;
 import io.airlift.http.client.HttpUriBuilder;
 import io.airlift.http.client.Request;
 import io.airlift.http.client.ResponseHandler;
@@ -40,6 +42,7 @@ import javax.inject.Inject;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.GET;
+import javax.ws.rs.POST;
 import javax.ws.rs.PUT;
 import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
@@ -53,14 +56,18 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Strings.nullToEmpty;
+import static com.google.common.net.HttpHeaders.CONTENT_TYPE;
 import static io.airlift.discovery.client.ServiceAnnouncement.serviceAnnouncement;
-import static io.airlift.http.client.HttpStatus.familyForStatusCode;
 import static io.airlift.http.client.Request.Builder.prepareDelete;
-import static io.airlift.http.client.Request.Builder.preparePut;
+import static io.airlift.http.client.Request.Builder.preparePost;
+import static io.airlift.http.client.ResponseHandlerUtils.propagate;
 import static io.airlift.http.client.StaticBodyGenerator.createStaticBodyGenerator;
 import static io.prestosql.server.security.ResourceSecurity.AccessType.PUBLIC;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -72,22 +79,65 @@ public class CatalogResource
 {
     private static final Logger log = Logger.get(CatalogResource.class);
     public static final JsonCodec<CatalogInfo> CATALOG_INFO_JSON_CODEC = JsonCodec.jsonCodec(CatalogInfo.class);
+    /**
+     * JsonResponseHandler.createJsonResponseHandler(JsonCodec.jsonCodec(Resp.class))
+     */
+    public static final ResponseHandler<Resp, RuntimeException> JSON_RESPONSE_HANDLER = new ResponseHandler<>()
+    {
+
+        private final com.google.common.net.MediaType MEDIA_TYPE_JSON = com.google.common.net.MediaType.create("application", "json");
+        private final JsonCodec<Resp> jsonCodec = JsonCodec.jsonCodec(Resp.class);
+        @Override
+        public Resp handleException(Request request, Exception exception) throws RuntimeException
+        {
+            throw propagate(request, exception);
+        }
+
+        @Override
+        public Resp handle(Request request, io.airlift.http.client.Response response) throws RuntimeException
+        {
+            String contentType = response.getHeader(CONTENT_TYPE);
+            if (contentType == null) {
+                return Resp.status(response.getStatusCode(), "Content-Type is not set for response");
+            }
+            if (!com.google.common.net.MediaType.parse(contentType).is(MEDIA_TYPE_JSON)) {
+                return Resp.status(response.getStatusCode(), "Expected application/json response from server but got " + contentType);
+            }
+            byte[] bytes;
+            try {
+                bytes = ByteStreams.toByteArray(response.getInputStream());
+            }
+            catch (Exception e) {
+                return Resp.status(response.getStatusCode(), "Error reading response from server");
+            }
+            try {
+                return jsonCodec.fromJson(bytes);
+            }
+            catch (IllegalArgumentException e) {
+                return Resp.status(response.getStatusCode(), new String(bytes, UTF_8));
+            }
+        }
+    };
     private final ConnectorManager connectorManager;
     private final CatalogManager catalogManager;
     private final InternalNodeManager nodeManager;
     private final HttpClient httpClient;
+    private final Announcer announcer;
+    private final AtomicBoolean startupComplete = new AtomicBoolean();
 
     @Inject
     public CatalogResource(
             ConnectorManager connectorManager,
             CatalogManager catalogManager,
             InternalNodeManager nodeManager,
-            @ForNodeManager HttpClient httpClient)
+            @ForNodeManager HttpClient httpClient,
+            Announcer announcer)
     {
         this.connectorManager = requireNonNull(connectorManager, "connectorManager is null");
         this.catalogManager = requireNonNull(catalogManager, "catalogManager is null");
         this.nodeManager = requireNonNull(nodeManager, "nodeManager is null");
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
+        this.announcer = requireNonNull(announcer, "announcer is null");
     }
 
     @ResourceSecurity(PUBLIC)
@@ -124,39 +174,91 @@ public class CatalogResource
     @PUT
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response create(CatalogInfo catalogInfo)
+    public synchronized Response putCreate(CatalogInfo catalogInfo)
+    {
+        return create(catalogInfo);
+    }
+
+    @ResourceSecurity(PUBLIC)
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public synchronized Response create(CatalogInfo catalogInfo)
     {
         if (!nodeManager.getCurrentNode().isCoordinator()) {
             return Response.status(Response.Status.NOT_FOUND).build();
         }
         requireNonNull(catalogInfo, "catalogInfo is null");
         for (InternalNode node : getNodes(false)) {
-            doNodeCreate(node, catalogInfo);
+            Resp nodeResponse = doNodeCreate(node, catalogInfo);
+            if (isFail(nodeResponse.getStatus())) {
+                return nodeResponse.toResponse();
+            }
         }
         for (InternalNode node : getNodes(true)) {
-            doNodeCreate(node, catalogInfo);
+            Resp nodeResponse = doNodeCreate(node, catalogInfo);
+            if (isFail(nodeResponse.getStatus())) {
+                return nodeResponse.toResponse();
+            }
         }
         return Response.status(Response.Status.OK).build();
     }
 
     @ResourceSecurity(PUBLIC)
     @PUT
+    @Path("save")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public synchronized Response putSave(CatalogInfo catalogInfo)
+    {
+        return save(catalogInfo);
+    }
+
+
+    @ResourceSecurity(PUBLIC)
+    @POST
+    @Path("save")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public synchronized Response save(CatalogInfo catalogInfo)
+    {
+        if (!nodeManager.getCurrentNode().isCoordinator()) {
+            return Response.status(Response.Status.NOT_FOUND).build();
+        }
+        requireNonNull(catalogInfo, "catalogInfo is null");
+        Response delete = delete(catalogInfo.getCatalogName());
+        if (isFail(delete.getStatus())) {
+            return delete;
+        }
+        return create(catalogInfo);
+    }
+
+    @ResourceSecurity(PUBLIC)
+    @POST
     @Path("node")
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response nodeCreate(CatalogInfo catalogInfo)
     {
+        if (!startupComplete.get()) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), "SERVER STRARTING").build();
+        }
         requireNonNull(catalogInfo, "catalogInfo is null");
         if (catalogManager.getCatalog(catalogInfo.getCatalogName()).isPresent()) {
             return Response.status(Response.Status.OK).build();
         }
 
-        CatalogName connectorId = connectorManager.createCatalog(
-                catalogInfo.getCatalogName(),
-                catalogInfo.getConnectorName(),
-                catalogInfo.getProperties());
+        try {
+            CatalogName connectorId = connectorManager.createCatalog(
+                    catalogInfo.getCatalogName(),
+                    catalogInfo.getConnectorName(),
+                    catalogInfo.getProperties());
 
-        //updateConnectorIdAnnouncement(announcer, connectorId);
+            updateConnectorIdAnnouncement(announcer, connectorId);
+        }
+        catch (Exception e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), e.getMessage()).build();
+        }
         return Response.status(Response.Status.OK).build();
     }
 
@@ -164,17 +266,23 @@ public class CatalogResource
     @DELETE
     @Path("{catalog}")
     @Produces(MediaType.APPLICATION_JSON)
-    public Response delete(@PathParam("catalog") String catalog)
+    public synchronized Response delete(@PathParam("catalog") String catalog)
     {
         if (!nodeManager.getCurrentNode().isCoordinator()) {
             return Response.status(Response.Status.NOT_FOUND).build();
         }
         requireNonNull(catalog, "catalogInfo is null");
         for (InternalNode node : getNodes(false)) {
-            doNodeDelete(node, catalog);
+            Resp nodeResponse = doNodeDelete(node, catalog);
+            if (isFail(nodeResponse.getStatus())) {
+                return nodeResponse.toResponse();
+            }
         }
         for (InternalNode node : getNodes(true)) {
-            doNodeDelete(node, catalog);
+            Resp nodeResponse = doNodeDelete(node, catalog);
+            if (isFail(nodeResponse.getStatus())) {
+                return nodeResponse.toResponse();
+            }
         }
         return Response.status(Response.Status.OK).build();
     }
@@ -185,19 +293,30 @@ public class CatalogResource
     @Produces(MediaType.APPLICATION_JSON)
     public Response nodeDelete(@PathParam("catalog") String catalog)
     {
+        if (!startupComplete.get()) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), "SERVER STRARTING").build();
+        }
         requireNonNull(catalog, "catalog is null");
-        connectorManager.dropConnection(catalog);
+        if (catalogManager.getCatalog(catalog).isEmpty()) {
+            return Response.status(Response.Status.OK).build();
+        }
+        try {
+            connectorManager.dropConnection(catalog);
+        }
+        catch (Exception e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), e.getMessage()).build();
+        }
         return Response.status(Response.Status.OK).build();
     }
 
     private static void updateConnectorIdAnnouncement(Announcer announcer, CatalogName connectorId)
     {
         //
-        // This code was copied from PrestoServer, and is a hack that should be removed when the connectorId property is removed
+        // This code was copied from TrinoServer, and is a hack that should be removed when the connectorId property is removed
         //
 
         // get existing announcement
-        ServiceAnnouncement announcement = getPrestoAnnouncement(announcer.getServiceAnnouncements());
+        ServiceAnnouncement announcement = getTrinoAnnouncement(announcer.getServiceAnnouncements());
 
         // update connectorIds property
         Map<String, String> properties = new LinkedHashMap<>(announcement.getProperties());
@@ -212,50 +331,36 @@ public class CatalogResource
         announcer.forceAnnounce();
     }
 
-    private static ServiceAnnouncement getPrestoAnnouncement(Set<ServiceAnnouncement> announcements)
+    private static ServiceAnnouncement getTrinoAnnouncement(Set<ServiceAnnouncement> announcements)
     {
         for (ServiceAnnouncement announcement : announcements) {
             if (announcement.getType().equals("presto")) {
                 return announcement;
             }
         }
-        throw new RuntimeException("Presto announcement not found: " + announcements);
+        throw new RuntimeException("Trino announcement not found: " + announcements);
     }
 
-    private void doNodeCreate(InternalNode node, CatalogInfo catalogInfo)
+    private Resp doNodeCreate(InternalNode node, CatalogInfo catalogInfo)
     {
         try {
             String path = "/v1/catalog/node";
             HttpUriBuilder httpUriBuilder = HttpUriBuilder.uriBuilderFrom(node.getInternalUri());
-            Request request = preparePut()
+            Request request = preparePost()
                     .setUri(httpUriBuilder.appendPath(path).build())
-                    .setHeader(HttpHeaders.CONTENT_TYPE, com.google.common.net.MediaType.JSON_UTF_8.toString())
+                    .setHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .setHeader(HttpHeaders.ACCEPT, "application/json")
                     .setBodyGenerator(createStaticBodyGenerator(CATALOG_INFO_JSON_CODEC.toJsonBytes(catalogInfo)))
                     .build();
-            httpClient.execute(request, new ResponseHandler<Void, RuntimeException>() {
-                @Override
-                public Void handleException(Request request, Exception exception)
-                {
-                    log.debug(exception, "request failed: %s", request.getUri());
-                    return null;
-                }
-
-                @Override
-                public Void handle(Request request, io.airlift.http.client.Response response)
-                {
-                    if (familyForStatusCode(response.getStatusCode()) != HttpStatus.Family.SUCCESSFUL) {
-                        log.debug("Unexpected response code: %s", response.getStatusCode());
-                    }
-                    return null;
-                }
-            });
+            return httpClient.execute(request, JSON_RESPONSE_HANDLER);
         }
         catch (Exception e) {
             log.error(e, "create catalog failed: %s", e.getMessage());
+            return Resp.status(Response.Status.GATEWAY_TIMEOUT.getStatusCode(), e.getMessage());
         }
     }
 
-    private void doNodeDelete(InternalNode node, String catalog)
+    private Resp doNodeDelete(InternalNode node, String catalog)
     {
         try {
             String path = "/v1/catalog/node/" + catalog;
@@ -263,27 +368,11 @@ public class CatalogResource
             Request request = prepareDelete()
                     .setUri(httpUriBuilder.appendPath(path).build())
                     .build();
-            httpClient.execute(request, new ResponseHandler<Void, RuntimeException>()
-            {
-                @Override
-                public Void handleException(Request request, Exception exception)
-                {
-                    log.debug(exception, "request failed: %s", request.getUri());
-                    return null;
-                }
-
-                @Override
-                public Void handle(Request request, io.airlift.http.client.Response response)
-                {
-                    if (familyForStatusCode(response.getStatusCode()) != HttpStatus.Family.SUCCESSFUL) {
-                        log.debug("Unexpected response code: %s", response.getStatusCode());
-                    }
-                    return null;
-                }
-            });
+            return httpClient.execute(request, JSON_RESPONSE_HANDLER);
         }
         catch (Exception e) {
             log.error(e, "create catalog failed: %s", e.getMessage());
+            return Resp.status(Response.Status.GATEWAY_TIMEOUT.getStatusCode(), e.getMessage());
         }
     }
 
@@ -308,5 +397,49 @@ public class CatalogResource
             }
         }
         return result;
+    }
+
+    private boolean isFail(int status)
+    {
+        return status / 10 != 20;
+    }
+
+    public static class Resp
+    {
+        private String message;
+        private int status;
+
+        @JsonCreator
+        public Resp(
+                @JsonProperty("status") int status,
+                @JsonProperty("message") String message)
+        {
+            this.message = message;
+            this.status = status;
+        }
+
+        public static Resp status(int status, String message)
+        {
+            return new Resp(status, message);
+        }
+
+        @JsonProperty
+        public String getMessage() {
+            return message;
+        }
+
+        @JsonProperty
+        public int getStatus() {
+            return status;
+        }
+
+        public Response toResponse() {
+            return Response.status(status, message).build();
+        }
+    }
+
+    public void startupComplete()
+    {
+        checkState(startupComplete.compareAndSet(false, true), "Server startup already marked as complete");
     }
 }
