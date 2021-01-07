@@ -428,6 +428,7 @@ public class ServerMainModule
         // catalog resource
         jaxrsBinder(binder).bind(CatalogResource.class);
         jsonCodecBinder(binder).bindJsonCodec(CatalogInfo.class);
+        jsonCodecBinder(binder).bindJsonCodec(CatalogResource.Resp.class);
         jsonCodecBinder(binder).bindJsonCodec(NodeInfo.class);
 
         // PageSorter
