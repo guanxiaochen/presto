@@ -22,6 +22,7 @@ import com.google.common.net.HttpHeaders;
 import io.airlift.discovery.client.Announcer;
 import io.airlift.discovery.client.ServiceAnnouncement;
 import io.airlift.http.client.HttpClient;
+import io.airlift.http.client.HttpStatus;
 import io.airlift.http.client.HttpUriBuilder;
 import io.airlift.http.client.Request;
 import io.airlift.http.client.ResponseHandler;
@@ -67,7 +68,6 @@ import static io.airlift.http.client.Request.Builder.preparePost;
 import static io.airlift.http.client.ResponseHandlerUtils.propagate;
 import static io.airlift.http.client.StaticBodyGenerator.createStaticBodyGenerator;
 import static io.prestosql.server.security.ResourceSecurity.AccessType.PUBLIC;
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -97,26 +97,17 @@ public class CatalogResource
         public Resp handle(Request request, io.airlift.http.client.Response response) throws RuntimeException
         {
             String contentType = response.getHeader(CONTENT_TYPE);
-            if (contentType == null) {
-                return Resp.status(response.getStatusCode(), "Content-Type is not set for response");
+            if (contentType != null && com.google.common.net.MediaType.parse(contentType).is(MEDIA_TYPE_JSON)) {
+                try {
+                    return jsonCodec.fromJson(ByteStreams.toByteArray(response.getInputStream()));
+                }
+                catch (Exception e) {
+                    log.warn("http handler error, uil:" + request.getUri() + ", message:" + e.getMessage());
+                }
             }
-            if (!com.google.common.net.MediaType.parse(contentType).is(MEDIA_TYPE_JSON)) {
-                return Resp.status(response.getStatusCode(), "Expected application/json response from server but got " + contentType);
-            }
-            byte[] bytes;
-            try {
-                bytes = ByteStreams.toByteArray(response.getInputStream());
-            }
-            catch (Exception e) {
-                return Resp.status(response.getStatusCode(), "Error reading response from server");
-            }
-            try {
-                return jsonCodec.fromJson(bytes);
-            }
-            catch (IllegalArgumentException e) {
-                return Resp.status(response.getStatusCode(), new String(bytes, UTF_8));
-            }
+            return Resp.status(response.getStatusCode(), HttpStatus.fromStatusCode(response.getStatusCode()).reason());
         }
+
     };
     private final ConnectorManager connectorManager;
     private final CatalogManager catalogManager;
@@ -186,7 +177,7 @@ public class CatalogResource
     public synchronized Response create(CatalogInfo catalogInfo)
     {
         if (!nodeManager.getCurrentNode().isCoordinator()) {
-            return Response.status(Response.Status.NOT_FOUND).build();
+            return toResponse(Response.Status.NOT_FOUND);
         }
         requireNonNull(catalogInfo, "catalogInfo is null");
         for (InternalNode node : getNodes(false)) {
@@ -201,7 +192,7 @@ public class CatalogResource
                 return nodeResponse.toResponse();
             }
         }
-        return Response.status(Response.Status.OK).build();
+        return toResponse(Response.Status.OK);
     }
 
     @ResourceSecurity(PUBLIC)
@@ -223,7 +214,7 @@ public class CatalogResource
     public synchronized Response save(CatalogInfo catalogInfo)
     {
         if (!nodeManager.getCurrentNode().isCoordinator()) {
-            return Response.status(Response.Status.NOT_FOUND).build();
+            return toResponse(Response.Status.NOT_FOUND);
         }
         requireNonNull(catalogInfo, "catalogInfo is null");
         Response delete = delete(catalogInfo.getCatalogName());
@@ -241,11 +232,11 @@ public class CatalogResource
     public Response nodeCreate(CatalogInfo catalogInfo)
     {
         if (!startupComplete.get()) {
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), "SERVER STRARTING").build();
+            return toResponse(Response.Status.INTERNAL_SERVER_ERROR, "SERVER STRARTING");
         }
         requireNonNull(catalogInfo, "catalogInfo is null");
         if (catalogManager.getCatalog(catalogInfo.getCatalogName()).isPresent()) {
-            return Response.status(Response.Status.OK).build();
+            return toResponse(Response.Status.OK);
         }
 
         try {
@@ -257,9 +248,9 @@ public class CatalogResource
             updateConnectorIdAnnouncement(announcer, connectorId);
         }
         catch (Exception e) {
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), e.getMessage()).build();
+            return toResponse(Response.Status.INTERNAL_SERVER_ERROR, e.getMessage());
         }
-        return Response.status(Response.Status.OK).build();
+        return toResponse(Response.Status.OK);
     }
 
     @ResourceSecurity(PUBLIC)
@@ -269,7 +260,7 @@ public class CatalogResource
     public synchronized Response delete(@PathParam("catalog") String catalog)
     {
         if (!nodeManager.getCurrentNode().isCoordinator()) {
-            return Response.status(Response.Status.NOT_FOUND).build();
+            return toResponse(Response.Status.NOT_FOUND);
         }
         requireNonNull(catalog, "catalogInfo is null");
         for (InternalNode node : getNodes(false)) {
@@ -284,7 +275,7 @@ public class CatalogResource
                 return nodeResponse.toResponse();
             }
         }
-        return Response.status(Response.Status.OK).build();
+        return toResponse(Response.Status.OK);
     }
 
     @ResourceSecurity(PUBLIC)
@@ -294,19 +285,19 @@ public class CatalogResource
     public Response nodeDelete(@PathParam("catalog") String catalog)
     {
         if (!startupComplete.get()) {
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), "SERVER STRARTING").build();
+            return toResponse(Response.Status.INTERNAL_SERVER_ERROR, "SERVER STRARTING");
         }
         requireNonNull(catalog, "catalog is null");
         if (catalogManager.getCatalog(catalog).isEmpty()) {
-            return Response.status(Response.Status.OK).build();
+            return toResponse(Response.Status.OK);
         }
         try {
             connectorManager.dropConnection(catalog);
         }
         catch (Exception e) {
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(), e.getMessage()).build();
+            return toResponse(Response.Status.INTERNAL_SERVER_ERROR, e.getMessage());
         }
-        return Response.status(Response.Status.OK).build();
+        return toResponse(Response.Status.OK);
     }
 
     private static void updateConnectorIdAnnouncement(Announcer announcer, CatalogName connectorId)
@@ -423,6 +414,11 @@ public class CatalogResource
             return new Resp(status, message);
         }
 
+        public static Resp status(Response.Status ok)
+        {
+            return new Resp(ok.getStatusCode(), ok.getReasonPhrase());
+        }
+
         @JsonProperty
         public String getMessage() {
             return message;
@@ -434,8 +430,16 @@ public class CatalogResource
         }
 
         public Response toResponse() {
-            return Response.status(status, message).build();
+            return Response.status(Response.Status.OK).entity(this).build();
         }
+    }
+
+    private Response toResponse(Response.Status status, String message) {
+        return Response.status(Response.Status.OK).entity(Resp.status(status.getStatusCode(), message)).build();
+    }
+
+    private Response toResponse(Response.Status status) {
+        return Response.status(Response.Status.OK).entity(Resp.status(status)).build();
     }
 
     public void startupComplete()
